@@ -24,6 +24,12 @@ app = QApplication([])
 
 
 class Tests(unittest.TestCase):
+    def test_blank_repository_with_nexus_id_is_eligible(self):
+        self.assertEqual(plugin.nexus_skip_reason('skyrimse', 35978, ''), '')
+        self.assertEqual(plugin.nexus_skip_reason('SkyrimSE', 35978, ' Nexus '), '')
+        self.assertEqual(plugin.nexus_skip_reason('SkyrimSE', 0, ''), 'Skipped: no Nexus game/mod ID')
+        self.assertEqual(plugin.nexus_skip_reason('SkyrimSE', 35978, 'Other'), 'Skipped: non-Nexus repository')
+
     def test_qt_metadata_roundtrip(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'meta.ini'

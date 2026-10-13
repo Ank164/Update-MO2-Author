@@ -18,6 +18,14 @@ def metadata(path):
     return {key: settings.value(key, "") for key in ("author", "modid", "gameName")}
 
 
+def nexus_skip_reason(game, modid, repository):
+    if modid <= 0 or not game:
+        return "Skipped: no Nexus game/mod ID"
+    if str(repository or "").strip().casefold() not in ("", "nexus"):
+        return "Skipped: non-Nexus repository"
+    return ""
+
+
 def write_author(path, author):
     """Use Qt's INI codec (including escaped strings), with atomic replacement."""
     path = Path(path)
@@ -76,7 +84,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Right-click selected installed mods to fill missing Nexus authors."
 
     def version(self):
-        return mobase.VersionInfo(1, 0, 2)
+        return mobase.VersionInfo(1, 0, 3)
 
     def settings(self):
         return []
@@ -131,8 +139,9 @@ class NexusAuthorMetadata(mobase.IPlugin):
                         row["status"] = "Skipped: author already present"
                         continue
                     game, modid = mod.gameName(), mod.nexusId()
-                    if modid <= 0 or not game or mod.repository().lower() != "nexus":
-                        row["status"] = "Skipped: no Nexus game/mod ID"
+                    reason = nexus_skip_reason(game, modid, mod.repository())
+                    if reason:
+                        row["status"] = reason
                         continue
                     row.update(game=game, modid=modid)
                     self.groups.setdefault((game, modid), []).append(row)
