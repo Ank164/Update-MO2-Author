@@ -51,7 +51,9 @@ Cancelling the fetching progress window discards the entire batch
 without opening manual-entry boxes. Completion is silent; reports record outcomes.
 
 Before writing, the plugin waits for any already-running MO2 refresh. Each metadata
-file is edited with Qt's own INI codec, verified and replaced atomically.
+file is edited with Qt's own INI codec, verified and replaced atomically. If a mod
+folder has no `meta.ini`, the plugin creates it when saving the author. It will
+not replace a file created by another process during that save.
 MO2 refreshes once afterward if any authors changed. Unrelated INI values are preserved, though Qt can
 normalize formatting. Each author is checked against its initial value immediately
 before writing; a value changed during the batch is preserved and reported instead

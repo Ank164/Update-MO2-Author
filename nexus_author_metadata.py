@@ -292,7 +292,12 @@ def nexus_skip_reason(game, modid, repository):
 def write_author(path, author, expected_author=None):
     """Use Qt's INI codec (including escaped strings), with atomic replacement."""
     path = Path(path)
-    original = path.read_bytes()
+    try:
+        original = path.read_bytes()
+    except FileNotFoundError:
+        if not path.parent.is_dir():
+            raise
+        original = None
     current = str(metadata(path)["author"])
     if expected_author is None:
         if current.strip():
@@ -304,7 +309,8 @@ def write_author(path, author, expected_author=None):
     handle, temporary = tempfile.mkstemp(prefix=".author-", suffix=".ini", dir=path.parent)
     os.close(handle)
     try:
-        shutil.copyfile(path, temporary)
+        if original is not None:
+            shutil.copyfile(path, temporary)
         settings = QSettings(temporary, QSettings.Format.IniFormat)
         settings.setValue("author", author)
         settings.sync()
@@ -313,9 +319,16 @@ def write_author(path, author, expected_author=None):
         del settings
         if metadata(temporary)["author"] != author:
             raise OSError("Author read-back did not match")
-        if path.read_bytes() != original:
-            raise OSError("Metadata changed during update; skipped")
-        os.replace(temporary, path)
+        if original is None:
+            # Publish the verified file without replacing one created meanwhile.
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                raise OSError("Metadata created during update; skipped") from None
+        else:
+            if path.read_bytes() != original:
+                raise OSError("Metadata changed during update; skipped")
+            os.replace(temporary, path)
         return True
     finally:
         if os.path.exists(temporary):
@@ -354,7 +367,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Update selected mod authors from Nexus or Dwemer Mods, confirming existing authors first."
 
     def version(self):
-        return mobase.VersionInfo(1, 4, 1)
+        return mobase.VersionInfo(1, 4, 2)
 
     def settings(self):
         return []

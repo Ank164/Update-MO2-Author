@@ -27,6 +27,43 @@ app.addLibraryPath(str(ROOT / 'dlls'))
 
 
 class Tests(unittest.TestCase):
+    def test_manual_batch_saves_when_meta_ini_is_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            mods, paths = {}, {}
+            for name in ("RB's set N4 - PBR", "RB's set N8 - PBR"):
+                directory = Path(folder) / name
+                directory.mkdir()
+                paths[name] = directory / 'meta.ini'
+                mods[name] = types.SimpleNamespace(
+                    absolutePath=lambda directory=directory: str(directory), nexusId=lambda: -1,
+                    gameName=lambda: 'SkyrimSE', repository=lambda: '')
+            obj = plugin.NexusAuthorMetadata()
+            refreshed = []
+            obj.organizer = types.SimpleNamespace(
+                modList=lambda: types.SimpleNamespace(getMod=mods.get), pluginDataPath=lambda: folder,
+                refresh=lambda: refreshed.append(True), onNextRefresh=lambda done, immediate: done())
+            with patch.object(plugin.DwemerClient, 'lookup', side_effect=lambda row, done: done({})), \
+                 patch.object(plugin.QTimer, 'singleShot', side_effect=lambda delay, done: done()), \
+                 patch.object(plugin, 'ask_author', return_value=('all', 'RB')):
+                obj.start(list(mods))
+            self.assertEqual([row['status'] for row in obj.rows], ['Updated', 'Updated'])
+            self.assertTrue(all(plugin.metadata(path)['author'] == 'RB' for path in paths.values()))
+            self.assertTrue(all([p.name for p in path.parent.iterdir()] == ['meta.ini'] for path in paths.values()))
+            self.assertEqual(refreshed, [True])
+
+    def test_missing_metadata_save_preserves_a_competing_new_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'meta.ini'
+            original_link = plugin.os.link
+            def competing_create(temporary, destination):
+                path.write_text('[General]\nauthor=Someone else\n', encoding='utf-8')
+                original_link(temporary, destination)
+            with patch.object(plugin.os, 'link', side_effect=competing_create):
+                with self.assertRaisesRegex(OSError, 'created during update'):
+                    plugin.write_author(path, 'RB', expected_author='')
+            self.assertEqual(plugin.metadata(path)['author'], 'Someone else')
+            self.assertEqual([p.name for p in path.parent.iterdir()], ['meta.ini'])
+
     def test_selected_dwemer_page_with_named_creator_saves_without_manual_prompt(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'meta.ini'
