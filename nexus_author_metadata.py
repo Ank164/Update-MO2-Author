@@ -78,7 +78,7 @@ class DwemerPage(HTMLParser):
         if tag == "a":
             href = attrs.get("href", "")
             url = dwemer_url(urljoin(DWEMER, href))
-            creator = (self.meta_depth is not None and href.startswith("/known-authors/?")
+            creator = (self.meta_depth is not None and href.startswith("/known-authors/")
                        and "mod-category-link" in attrs.get("class", "").split())
             if (self.title_depth and url) or creator:
                 self.anchor = (url if not creator else "creator", [])
@@ -354,7 +354,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Update selected mod authors from Nexus or Dwemer Mods, confirming existing authors first."
 
     def version(self):
-        return mobase.VersionInfo(1, 4, 0)
+        return mobase.VersionInfo(1, 4, 1)
 
     def settings(self):
         return []

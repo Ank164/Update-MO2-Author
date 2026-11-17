@@ -27,6 +27,33 @@ app.addLibraryPath(str(ROOT / 'dlls'))
 
 
 class Tests(unittest.TestCase):
+    def test_selected_dwemer_page_with_named_creator_saves_without_manual_prompt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'meta.ini'
+            path.write_text('[General]\nauthor=\n', encoding='utf-8')
+            mod = types.SimpleNamespace(absolutePath=lambda: folder, nexusId=lambda: 0,
+                                        gameName=lambda: 'SkyrimSE', repository=lambda: '')
+            obj = plugin.NexusAuthorMetadata()
+            obj.organizer = types.SimpleNamespace(
+                modList=lambda: types.SimpleNamespace(getMod=lambda name: mod),
+                pluginDataPath=lambda: folder, refresh=lambda: None,
+                onNextRefresh=lambda done, immediate: done())
+            url = 'https://dwemermods.com/mods/5242?lang=en'
+            detail = self.dwemer_detail('Firon').replace('/known-authors/?q=creator', '/known-authors/firon')
+            def get(client, requested, done):
+                done(self.search_card("Firon&#39;sFactory Hetz-Hexe 3BA SMP", 5242)
+                     if '/mods?' in requested else detail, '')
+            with patch.object(plugin.DwemerClient, 'get', new=get), \
+                 patch.object(plugin.QTimer, 'singleShot', side_effect=lambda delay, done: done()), \
+                 patch.object(plugin, 'choose_dwemer', return_value=url) as picker, \
+                 patch.object(plugin, 'ask_author') as manual:
+                obj.start(["Firon'sFactory Hetz-Hexe"])
+            self.assertEqual(picker.call_count, 1)
+            manual.assert_not_called()
+            self.assertEqual(plugin.metadata(path)['author'], 'Firon')
+            self.assertEqual(obj.rows[0]['source'], 'dwemer')
+            self.assertFalse(obj.busy)
+
     def test_existing_authors_require_confirmation_before_lookups(self):
         for decision in ('cancel', 'overwrite', 'cancel_manual'):
             with self.subTest(decision=decision), tempfile.TemporaryDirectory() as folder:
