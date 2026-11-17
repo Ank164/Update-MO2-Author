@@ -38,7 +38,7 @@ class Tests(unittest.TestCase):
                     modList=lambda: types.SimpleNamespace(getMod=lambda name: mod),
                     pluginDataPath=lambda: folder, refresh=lambda: None,
                     onNextRefresh=lambda callback, immediate: callback(), createNexusBridge=bridge)
-                with patch.object(plugin.QInputDialog, 'getText', return_value=('Manual Author', True)) as prompt:
+                with patch.object(plugin, 'ask_author', return_value=('ok', 'Manual Author')) as prompt:
                     obj.start(['Local mod'])
                 self.assertEqual(prompt.call_count, 1)
                 self.assertEqual(bridge.call_count, int(modid > 0))
@@ -61,26 +61,72 @@ class Tests(unittest.TestCase):
                 modList=lambda: types.SimpleNamespace(getMod=lambda name: mod),
                 pluginDataPath=lambda: folder, refresh=lambda: refreshed.append(True))
             obj.finish = lambda: None
-            with patch.object(plugin.QInputDialog, 'getText', return_value=('  Créateur, Team  ', True)) as prompt:
+            with patch.object(plugin, 'ask_author', return_value=('ok', 'Créateur, Team')) as prompt:
                 obj.prompt_missing_authors()
-            self.assertIn('Local mod', prompt.call_args.args[2])
+            self.assertIn('Local mod', prompt.call_args.args[1])
             obj.apply()
             self.assertEqual(plugin.metadata(path)['author'], 'Créateur, Team')
             self.assertEqual(obj.rows[0]['status'], 'Updated')
             self.assertEqual(refreshed, [True])
 
-    def test_manual_fallback_skips_cancel_blank_and_existing_authors(self):
+    def manual_batch(self):
         obj = plugin.NexusAuthorMetadata()
-        obj.window = None
         obj.rows = [dict(mod=str(i), game='SkyrimSE', modid=i, status=status)
                     for i, status in enumerate([
                         'Failed: unavailable', 'Skipped: Nexus returned no author',
-                        'Ready', 'Skipped: author already present'])]
-        original = [dict(row) for row in obj.rows]
-        with patch.object(plugin.QInputDialog, 'getText', side_effect=[('Ignored', False), ('   ', True)]) as prompt:
-            obj.prompt_missing_authors()
+                        'Skipped: no Nexus game/mod ID', 'Ready', 'Skipped: author already present'])]
+        return obj
+
+    def test_all_sets_remaining_mods_and_preserves_other_authors(self):
+        obj = self.manual_batch()
+        untouched = [dict(row) for row in obj.rows[3:]]
+        with patch.object(plugin, 'ask_author', return_value=('all', 'Team')) as prompt:
+            self.assertTrue(obj.prompt_missing_authors())
+        self.assertEqual(prompt.call_count, 1)
+        self.assertEqual(prompt.call_args.args[3], 3)
+        self.assertEqual([row['author'] for row in obj.rows[:3]], ['Team'] * 3)
+        self.assertEqual(obj.rows[3:], untouched)
+
+    def test_ok_advances_and_all_only_sets_remaining_mods(self):
+        obj = self.manual_batch()
+        with patch.object(plugin, 'ask_author', side_effect=[('ok', 'First'), ('all', 'Team')]) as prompt:
+            self.assertTrue(obj.prompt_missing_authors())
         self.assertEqual(prompt.call_count, 2)
-        self.assertEqual(obj.rows, original)
+        self.assertEqual([row['author'] for row in obj.rows[:3]], ['First', 'Team', 'Team'])
+
+    def test_cancel_discards_entire_batch_before_saving(self):
+        obj = self.manual_batch()
+        obj.busy = True
+        obj.queue = []
+        obj.progress = types.SimpleNamespace(hide=lambda: None)
+        obj.finish = lambda: setattr(obj, 'busy', False)
+        obj.organizer = types.SimpleNamespace(onNextRefresh=unittest.mock.Mock())
+        with patch.object(plugin, 'ask_author', side_effect=[('ok', 'First'), ('cancel', '')]) as prompt:
+            obj.next_request()
+        self.assertFalse(obj.busy)
+        obj.organizer.onNextRefresh.assert_not_called()
+        self.assertEqual(prompt.call_count, 2)
+        self.assertEqual(obj.rows[0]['status'], 'Cancelled: no change made')
+        self.assertEqual(obj.rows[3]['status'], 'Cancelled: no change made')
+
+    def test_dialog_buttons_and_blank_author(self):
+        for action in ('ok', 'all', 'cancel'):
+            with self.subTest(action=action):
+                dialog = plugin.AuthorDialog(None, 'Test mod', 'Nexus unavailable', 3)
+                self.assertFalse(dialog.ok.isEnabled())
+                self.assertFalse(dialog.all.isEnabled())
+                dialog.author.setText('   ')
+                self.assertFalse(dialog.ok.isEnabled())
+                dialog.author.setText('  Author  ')
+                self.assertTrue(dialog.ok.isEnabled())
+                self.assertTrue(dialog.all.isEnabled())
+                if action == 'cancel':
+                    dialog.reject()
+                    self.assertEqual(dialog.result(), plugin.QDialog.DialogCode.Rejected)
+                else:
+                    getattr(dialog, action).click()
+                    self.assertEqual(dialog.action, action)
+                    self.assertEqual(dialog.result(), plugin.QDialog.DialogCode.Accepted)
 
     def test_timeout_offers_manual_fallback_and_preserves_fetched_authors(self):
         obj = plugin.NexusAuthorMetadata()

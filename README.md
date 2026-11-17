@@ -11,8 +11,13 @@ Uses MO2's existing Nexus login. Fills only blank author fields from Nexus's
 author value; the uploader is a separate field and is not substituted. If Nexus
 cannot supply an author, a box shows the mod name and the lookup problem so you
 can enter the author manually. This also works for mods without a Nexus ID or
-from other repositories. Each mod gets its own entry; Cancel or a blank entry
-skips that mod. Existing authors are never overwritten. No mod contents are edited.
+from other repositories. **OK** applies the entered author to the current mod and
+asks for the next one. **All** applies that author to the current mod and all
+remaining unresolved mods without more prompts. Authors entered with earlier OK
+clicks are kept. **Cancel** (or closing the box) cancels the entire batch without
+saving, including earlier entries and fetched results. A nonblank author is
+required for OK or All. Existing authors are never overwritten. No mod contents
+are edited.
 
 Requests run sequentially, one per distinct game/mod ID. A login/access/rate-limit
 error stops further lookups. Cancel discards fetched results without applying them.

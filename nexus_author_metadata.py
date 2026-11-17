@@ -10,7 +10,50 @@ import uuid
 import mobase
 from PyQt6.QtCore import QObject, QEvent, QSettings, QTimer
 from PyQt6.QtGui import QAction
-from PyQt6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox, QProgressDialog
+from PyQt6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QLabel,
+                            QLineEdit, QMenu, QMessageBox, QProgressDialog, QVBoxLayout)
+
+
+class AuthorDialog(QDialog):
+    def __init__(self, parent, mod, reason, remaining):
+        super().__init__(parent)
+        self.setWindowTitle("Enter mod author")
+        self.action = "cancel"
+        layout = QVBoxLayout(self)
+        label = QLabel(f"Mod: {mod}\n{reason}\n\n"
+                       f"{remaining} mods remaining. OK sets this mod; All sets all remaining mods.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.author = QLineEdit(self)
+        self.author.setPlaceholderText("Author")
+        layout.addWidget(self.author)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.all = buttons.addButton("All", QDialogButtonBox.ButtonRole.ActionRole)
+        self.all.setEnabled(False)
+        self.all.setVisible(remaining > 1)
+        self.ok.setEnabled(False)
+        self.author.textChanged.connect(lambda text: self.enable_buttons(bool(text.strip())))
+        buttons.accepted.connect(lambda: self.choose("ok"))
+        buttons.rejected.connect(self.reject)
+        self.all.clicked.connect(lambda: self.choose("all"))
+        layout.addWidget(buttons)
+
+    def enable_buttons(self, enabled):
+        self.ok.setEnabled(enabled)
+        self.all.setEnabled(enabled)
+
+    def choose(self, action):
+        if self.author.text().strip():
+            self.action = action
+            self.accept()
+
+
+def ask_author(parent, mod, reason, remaining):
+    dialog = AuthorDialog(parent, mod, reason, remaining)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return "cancel", ""
+    return dialog.action, dialog.author.text().strip()
 
 
 def metadata(path):
@@ -84,7 +127,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Right-click selected installed mods to fill missing Nexus authors."
 
     def version(self):
-        return mobase.VersionInfo(1, 1, 0)
+        return mobase.VersionInfo(1, 2, 0)
 
     def settings(self):
         return []
@@ -181,7 +224,9 @@ class NexusAuthorMetadata(mobase.IPlugin):
         if not self.queue:
             self.current = None
             self.progress.hide()
-            self.prompt_missing_authors()
+            if not self.prompt_missing_authors():
+                self.cancel()
+                return
             self.progress.setLabelText("Saving author metadata…")
             # Wait for an existing refresh, or apply now; do not start another.
             self.organizer.onNextRefresh(self.apply, True)
@@ -237,22 +282,19 @@ class NexusAuthorMetadata(mobase.IPlugin):
         QTimer.singleShot(0, self.next_request)
 
     def prompt_missing_authors(self):
-        for row in self.rows:
-            if row["status"] in ("Ready", "Skipped: author already present"):
-                continue
-            # Only offer a write when the mod identity was captured successfully.
-            if "game" not in row or "modid" not in row:
-                continue
-            reason = row["status"]
-            author, accepted = QInputDialog.getText(
-                self.window,
-                "Enter mod author",
-                f"Mod: {row['mod']}\n{reason}\n\n"
-                "Enter the author manually, or Cancel to skip this mod:",
-            )
-            author = author.strip()
-            if accepted and author:
-                row.update(author=author, status="Ready", source="manual", nexus_status=reason)
+        pending = [row for row in self.rows
+                   if row["status"] not in ("Ready", "Skipped: author already present")
+                   and "game" in row and "modid" in row]
+        for index, row in enumerate(pending):
+            action, author = ask_author(self.window, row["mod"], row["status"], len(pending) - index)
+            if action == "cancel":
+                return False
+            targets = pending[index:] if action == "all" else [row]
+            for target in targets:
+                target.update(author=author, status="Ready", source="manual", nexus_status=target["status"])
+            if action == "all":
+                break
+        return True
 
     def cancel(self):
         if not self.busy:
