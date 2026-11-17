@@ -27,6 +27,73 @@ app.addLibraryPath(str(ROOT / 'dlls'))
 
 
 class Tests(unittest.TestCase):
+    def test_existing_authors_require_confirmation_before_lookups(self):
+        for decision in ('cancel', 'overwrite', 'cancel_manual'):
+            with self.subTest(decision=decision), tempfile.TemporaryDirectory() as folder:
+                mods, paths = {}, {}
+                for name, author in [('Existing', 'Old Author'), ('Blank', '')]:
+                    directory = Path(folder) / name
+                    directory.mkdir()
+                    paths[name] = directory / 'meta.ini'
+                    paths[name].write_text(f'[General]\nauthor={author}\n', encoding='utf-8')
+                    mods[name] = types.SimpleNamespace(
+                        absolutePath=lambda directory=directory: str(directory), nexusId=lambda: 0,
+                        gameName=lambda: 'SkyrimSE', repository=lambda: '')
+                obj = plugin.NexusAuthorMetadata()
+                refresh = unittest.mock.Mock()
+                obj.organizer = types.SimpleNamespace(
+                    modList=lambda: types.SimpleNamespace(getMod=mods.get), pluginDataPath=lambda: folder,
+                    refresh=refresh, onNextRefresh=lambda done, immediate: done())
+                confirmed = []
+                def confirm(parent, rows):
+                    self.assertEqual([(row['mod'], row['original_author']) for row in rows], [('Existing', 'Old Author')])
+                    confirmed.append(True)
+                    return decision != 'cancel'
+                def lookup(row, done):
+                    self.assertTrue(confirmed)
+                    self.assertEqual(plugin.metadata(paths['Existing'])['author'], 'Old Author')
+                    done({})
+                with patch.object(plugin, 'confirm_overwrite', side_effect=confirm) as confirm_box, \
+                     patch.object(plugin.DwemerClient, 'lookup', side_effect=lookup) as search, \
+                     patch.object(plugin.QTimer, 'singleShot', side_effect=lambda delay, done: done()), \
+                     patch.object(plugin, 'ask_author', return_value=('cancel', '') if decision == 'cancel_manual' else ('all', 'New Author')):
+                    obj.start(list(mods))
+                self.assertEqual(confirm_box.call_count, 1)
+                self.assertEqual(search.call_count, 0 if decision == 'cancel' else 2)
+                self.assertFalse(obj.busy)
+                self.assertEqual(plugin.metadata(paths['Existing'])['author'], 'New Author' if decision == 'overwrite' else 'Old Author')
+                self.assertEqual(plugin.metadata(paths['Blank'])['author'], 'New Author' if decision == 'overwrite' else '')
+                self.assertEqual(refresh.call_count, int(decision == 'overwrite'))
+
+    def test_overwrite_rechecks_author_snapshot_and_preserves_unrelated_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'meta.ini'
+            path.write_text('[General]\nauthor=Old\nmodid=123\nnotes=Keep me\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'changed since confirmation'):
+                plugin.write_author(path, 'New', expected_author='Wrong snapshot')
+            self.assertEqual(plugin.metadata(path)['author'], 'Old')
+            self.assertTrue(plugin.write_author(path, 'Créateur, Team', expected_author='Old'))
+            self.assertEqual(plugin.metadata(path)['author'], 'Créateur, Team')
+            settings = QSettings(str(path), QSettings.Format.IniFormat)
+            self.assertEqual(settings.value('modid'), '123')
+            self.assertEqual(settings.value('notes'), 'Keep me')
+            self.assertFalse(plugin.write_author(path, 'Créateur, Team', expected_author='Créateur, Team'))
+            with self.assertRaisesRegex(ValueError, 'changed since confirmation'):
+                plugin.write_author(path, 'Another', expected_author='Old')
+
+    def test_overwrite_dialog_cancel_default_and_buttons(self):
+        from PyQt6.QtCore import QTimer
+        for overwrite in (False, True):
+            def click():
+                dialog = app.activeModalWidget()
+                self.assertEqual(dialog.defaultButton(), dialog.button(plugin.QMessageBox.StandardButton.Cancel))
+                if overwrite:
+                    next(button for button in dialog.buttons() if button.text() == 'Overwrite').click()
+                else:
+                    dialog.reject()
+            QTimer.singleShot(0, click)
+            self.assertEqual(plugin.confirm_overwrite(None, [{'mod': 'Example', 'original_author': 'Old'}]), overwrite)
+
     def test_dwemer_batch_saves_found_and_manual_authors_or_cancels_all(self):
         for cancel in (False, True):
             with self.subTest(cancel=cancel), tempfile.TemporaryDirectory() as folder:

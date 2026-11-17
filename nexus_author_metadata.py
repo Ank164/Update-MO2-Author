@@ -1,4 +1,4 @@
-"""Fill missing installed-mod authors from Nexus, Dwemer Mods, or manual entry."""
+"""Update installed-mod authors from Nexus, Dwemer Mods, or manual entry."""
 from pathlib import Path
 from datetime import datetime
 import json
@@ -259,6 +259,22 @@ def ask_author(parent, mod, reason, remaining):
     return dialog.action, dialog.author.text().strip()
 
 
+def confirm_overwrite(parent, rows):
+    dialog = QMessageBox(parent)
+    dialog.setWindowTitle("Overwrite existing authors?")
+    dialog.setIcon(QMessageBox.Icon.Question)
+    dialog.setText(f"{len(rows)} selected mods already have an author.")
+    dialog.setInformativeText("Overwrite allows their authors to be replaced by Nexus, Dwemer, or manual entry. "
+                              "Cancel stops the entire batch without changes.")
+    dialog.setDetailedText("\n".join(f"{row['mod']}: {row['original_author']}" for row in rows))
+    overwrite = dialog.addButton("Overwrite", QMessageBox.ButtonRole.AcceptRole)
+    cancel = dialog.addButton(QMessageBox.StandardButton.Cancel)
+    dialog.setDefaultButton(cancel)
+    dialog.setEscapeButton(cancel)
+    dialog.exec()
+    return dialog.clickedButton() is overwrite
+
+
 def metadata(path):
     settings = QSettings(str(path), QSettings.Format.IniFormat)
     return {key: settings.value(key, "") for key in
@@ -273,12 +289,18 @@ def nexus_skip_reason(game, modid, repository):
     return ""
 
 
-def write_author(path, author):
+def write_author(path, author, expected_author=None):
     """Use Qt's INI codec (including escaped strings), with atomic replacement."""
     path = Path(path)
-    if str(metadata(path)["author"]).strip():
-        return False
     original = path.read_bytes()
+    current = str(metadata(path)["author"])
+    if expected_author is None:
+        if current.strip():
+            return False
+    elif current != expected_author:
+        raise ValueError("Author changed since confirmation; skipped")
+    if current == author:
+        return False
     handle, temporary = tempfile.mkstemp(prefix=".author-", suffix=".ini", dir=path.parent)
     os.close(handle)
     try:
@@ -329,10 +351,10 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Ron / OpenAI"
 
     def description(self):
-        return "Right-click selected installed mods to fill missing authors from Nexus or Dwemer Mods."
+        return "Update selected mod authors from Nexus or Dwemer Mods, confirming existing authors first."
 
     def version(self):
-        return mobase.VersionInfo(1, 3, 0)
+        return mobase.VersionInfo(1, 4, 0)
 
     def settings(self):
         return []
@@ -359,7 +381,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
                 mod = self.organizer.modList().getMod(name)
                 if mod and not any((mod.isSeparator(), mod.isForeign(), mod.isBackup(), mod.isOverwrite())):
                     names.append(name)
-        action = QAction("Fill missing authors from Nexus / Dwemer", menu)
+        action = QAction("Update authors from Nexus / Dwemer", menu)
         action.setEnabled(bool(names) and not self.busy)
         action.triggered.connect(lambda checked=False: QTimer.singleShot(0, lambda: self.start(names)))
         menu.addSeparator()
@@ -384,9 +406,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
                 self.rows.append(row)
                 try:
                     info = metadata(path)
-                    if str(info["author"]).strip():
-                        row["status"] = "Skipped: author already present"
-                        continue
+                    row["original_author"] = str(info["author"])
                     game, modid = mod.gameName(), mod.nexusId()
                     row.update(game=game, modid=modid)
                     row.update({key: info[key] for key in ("url", "website", "customURL", "installationFile")})
@@ -400,9 +420,13 @@ class NexusAuthorMetadata(mobase.IPlugin):
                     self.groups.setdefault((game, modid), []).append(row)
                 except Exception as error:
                     row["status"] = f"Failed: {error}"
+            existing = [row for row in self.rows if row.get("original_author", "").strip()]
+            if existing and not confirm_overwrite(self.window, existing):
+                self.cancel()
+                return
             self.queue = list(self.groups)
             self.total = len(self.queue)
-            self.progress = QProgressDialog("Fetching missing authors from Nexus…", "Cancel", 0, self.total, self.window)
+            self.progress = QProgressDialog("Fetching authors from Nexus…", "Cancel", 0, self.total, self.window)
             self.progress.setWindowTitle(self.name())
             self.progress.setMinimumDuration(0)
             self.progress.setAutoClose(False)
@@ -541,6 +565,8 @@ class NexusAuthorMetadata(mobase.IPlugin):
             reason = row["status"]
             if row.get("dwemer_status"):
                 reason += "\n" + row["dwemer_status"]
+            if row.get("original_author", "").strip():
+                reason += "\nCurrent author: " + row["original_author"]
             action, author = ask_author(self.window, row["mod"], reason, len(pending) - index)
             if action == "cancel":
                 return False
@@ -571,8 +597,8 @@ class NexusAuthorMetadata(mobase.IPlugin):
                     mod = self.organizer.modList().getMod(row["mod"])
                     if mod is None or str(Path(mod.absolutePath()) / "meta.ini") != row["path"] or mod.nexusId() != row["modid"] or mod.gameName() != row["game"]:
                         raise ValueError("Mod changed since lookup; skipped")
-                    updated = write_author(Path(row["path"]), row["author"])
-                    row["status"] = "Updated" if updated else "Skipped: author already present"
+                    updated = write_author(Path(row["path"]), row["author"], row.get("original_author", ""))
+                    row["status"] = "Updated" if updated else "Skipped: author unchanged"
                 except Exception as error:
                     row["status"] = f"Failed: {error}"
         finally:
