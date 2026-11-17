@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unicodedata  # Load the test interpreter's extension before MO2's library path.
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent
@@ -22,9 +23,126 @@ spec = importlib.util.spec_from_file_location('plugin', REPO / 'nexus_author_met
 plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
 app = QApplication([])
+app.addLibraryPath(str(ROOT / 'dlls'))
 
 
 class Tests(unittest.TestCase):
+    def test_dwemer_batch_saves_found_and_manual_authors_or_cancels_all(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel), tempfile.TemporaryDirectory() as folder:
+                mods = {}
+                paths = {}
+                for name in ('Found', 'Unresolved'):
+                    directory = Path(folder) / name
+                    directory.mkdir()
+                    paths[name] = directory / 'meta.ini'
+                    paths[name].write_text('[General]\nauthor=\n', encoding='utf-8')
+                    mods[name] = types.SimpleNamespace(
+                        absolutePath=lambda directory=directory: str(directory), nexusId=lambda: 0,
+                        gameName=lambda: 'SkyrimSE', repository=lambda: '')
+                obj = plugin.NexusAuthorMetadata()
+                refreshed = []
+                obj.organizer = types.SimpleNamespace(
+                    modList=lambda: types.SimpleNamespace(getMod=mods.get), pluginDataPath=lambda: folder,
+                    refresh=lambda: refreshed.append(True), onNextRefresh=lambda done, immediate: done())
+                def lookup(row, done):
+                    # Neither earlier lookups nor prompts may write before completion.
+                    self.assertTrue(all(plugin.metadata(path)['author'] == '' for path in paths.values()))
+                    done({'author': 'Found Creator', 'url': 'https://dwemermods.com/mods/1'}
+                         if row['mod'] == 'Found' else {})
+                with patch.object(plugin.DwemerClient, 'lookup', side_effect=lookup), \
+                     patch.object(plugin.QTimer, 'singleShot', side_effect=lambda delay, done: done()), \
+                     patch.object(plugin, 'ask_author', return_value=('cancel', '') if cancel else ('all', 'Manual Creator')):
+                    obj.start(list(mods))
+                self.assertFalse(obj.busy)
+                self.assertEqual(plugin.metadata(paths['Found'])['author'], '' if cancel else 'Found Creator')
+                self.assertEqual(plugin.metadata(paths['Unresolved'])['author'], '' if cancel else 'Manual Creator')
+                self.assertEqual(len(refreshed), 0 if cancel else 1)
+
+    def dwemer_detail(self, author='Real Creator'):
+        return ('<script type="application/ld+json">{"author":{"name":"Uploader"}}</script>'
+                '<div class="mod-meta-row"><span>Uploaded by: '
+                '<a class="mod-author-link" href="/users/uploader">Uploader</a></span>'
+                '<span>Created by: <a class="mod-category-link" href="/known-authors/?q=creator">'
+                + author + '</a></span></div>'
+                '<a class="mod-category-link" href="/known-authors/?q=other">Description credit</a>')
+
+    def search_card(self, title, modid):
+        return f'<h3 class="mod-title"><a href="/mods/{modid}">{title}</a></h3>'
+
+    def dwemer_lookup(self, row, search_html):
+        client = plugin.DwemerClient()
+        urls, results = [], []
+        def get(url, callback):
+            urls.append(url)
+            callback(search_html if '/mods?' in url else self.dwemer_detail(), '')
+        client.get = get
+        with patch.object(plugin.QTimer, 'singleShot', side_effect=lambda delay, done: done()):
+            client.lookup(row, results.append)
+        return urls, results[0]
+
+    def test_dwemer_reads_creator_not_uploader_or_description_credits(self):
+        page = plugin.DwemerPage(self.dwemer_detail('Cr&eacute;ateur &amp; Team'))
+        self.assertEqual(page.author, 'Créateur & Team')
+        self.assertEqual(plugin.DwemerPage('<script>{"author":"Uploader"}</script>').author, '')
+
+    def test_dwemer_saved_url_avoids_name_search(self):
+        urls, result = self.dwemer_lookup({'mod': 'Renamed', 'url': 'https://www.dwemermods.com/mods/3354#files'}, '')
+        self.assertEqual(urls, ['https://dwemermods.com/mods/3354?lang=en'])
+        self.assertEqual(result['author'], 'Real Creator')
+        for url in ['https://evil.com/mods/1', 'https://dwemermods.com.evil.com/mods/1',
+                    'https://dwemermods.com@evil.com/mods/1', 'https://dwemermods.com/mods', 'http://[']:
+            self.assertEqual(plugin.dwemer_url(url), '')
+
+    def test_dwemer_exact_name_and_archive_match(self):
+        for row in [{'mod': 'Example Armor'}, {'mod': 'My renamed mod', 'installationFile': r'C:\Downloads\Example Armor.7z'}]:
+            urls, result = self.dwemer_lookup(row, self.search_card('Example Armor', 12))
+            self.assertEqual(result['author'], 'Real Creator')
+            self.assertIn('/mods/12?', urls[-1])
+
+    def test_dwemer_ambiguous_partial_and_paginated_results_need_picker(self):
+        for html in [self.search_card('Example Armor', 1) + self.search_card('Example Armor', 2),
+                     self.search_card('Example Armor Recolor', 1),
+                     self.search_card('Example Armor', 1) + '<a href="/mods?search=Example&amp;page=2">2</a>']:
+            urls, result = self.dwemer_lookup({'mod': 'Example Armor'}, html)
+            self.assertNotIn('author', result)
+            self.assertTrue(result['candidates'])
+            self.assertTrue(all('/mods?' in url for url in urls))
+
+    def test_dwemer_search_uses_cleaned_archive_and_skips_other_games(self):
+        urls, result = self.dwemer_lookup({'mod': 'Renamed', 'installationFile': 'Example_Armor-12345-1-0.7z'}, '')
+        self.assertTrue(any('search=Example+Armor' in url for url in urls))
+        self.assertEqual(result, {'candidates': []})
+        urls, result = self.dwemer_lookup({'mod': 'Example Armor', 'game': 'Fallout4'}, '')
+        self.assertEqual(urls, [])
+        self.assertIn('supports Skyrim', result['error'])
+
+    def test_dwemer_result_picker_and_cancel(self):
+        for choice in (None, '', 'https://dwemermods.com/mods/12?lang=en'):
+            obj = plugin.NexusAuthorMetadata()
+            obj.busy = True
+            obj.token = 'batch'
+            obj.rows = [{'mod': 'Test', 'status': 'Failed: Nexus'}]
+            obj.progress = types.SimpleNamespace(hide=lambda: None, show=lambda: None)
+            obj.finish = lambda: setattr(obj, 'busy', False)
+            obj.dwemer = types.SimpleNamespace(detail=unittest.mock.Mock())
+            with patch.object(plugin, 'choose_dwemer', return_value=choice), patch.object(plugin.QTimer, 'singleShot') as schedule:
+                obj.dwemer_result('batch', obj.rows[0], {'candidates': [{'title': 'Test', 'url': 'url'}]})
+            if choice is None:
+                self.assertFalse(obj.busy)
+                schedule.assert_not_called()
+            elif choice:
+                self.assertEqual(obj.dwemer.detail.call_args.args[0], choice)
+            else:
+                self.assertIn('dwemer_status', obj.rows[0])
+                self.assertEqual(schedule.call_count, 1)
+
+    def test_dwemer_picker_can_select_page_manual_or_cancel(self):
+        candidates = [{'title': 'Example Armor', 'url': 'https://dwemermods.com/mods/12?lang=en'}]
+        for index, accepted, expected in [(1, True, candidates[0]['url']), (0, True, ''), (0, False, None)]:
+            with patch.object(plugin.QInputDialog, 'getItem', side_effect=lambda parent, title, label, items, current, editable: (items[index], accepted)):
+                self.assertEqual(plugin.choose_dwemer(None, 'Installed name', candidates), expected)
+
     def test_batch_falls_back_when_nexus_unavailable_or_mod_has_no_id(self):
         for modid in (0, 123):
             with self.subTest(modid=modid), tempfile.TemporaryDirectory() as folder:
@@ -38,7 +156,9 @@ class Tests(unittest.TestCase):
                     modList=lambda: types.SimpleNamespace(getMod=lambda name: mod),
                     pluginDataPath=lambda: folder, refresh=lambda: None,
                     onNextRefresh=lambda callback, immediate: callback(), createNexusBridge=bridge)
-                with patch.object(plugin, 'ask_author', return_value=('ok', 'Manual Author')) as prompt:
+                with patch.object(plugin, 'ask_author', return_value=('ok', 'Manual Author')) as prompt, \
+                     patch.object(plugin.DwemerClient, 'lookup', side_effect=lambda row, done: done({})), \
+                     patch.object(plugin.QTimer, 'singleShot', side_effect=lambda delay, callback: callback()):
                     obj.start(['Local mod'])
                 self.assertEqual(prompt.call_count, 1)
                 self.assertEqual(bridge.call_count, int(modid > 0))
@@ -97,12 +217,13 @@ class Tests(unittest.TestCase):
     def test_cancel_discards_entire_batch_before_saving(self):
         obj = self.manual_batch()
         obj.busy = True
-        obj.queue = []
+        obj.dwemer_queue = []
+        obj.token = 'test'
         obj.progress = types.SimpleNamespace(hide=lambda: None)
         obj.finish = lambda: setattr(obj, 'busy', False)
         obj.organizer = types.SimpleNamespace(onNextRefresh=unittest.mock.Mock())
         with patch.object(plugin, 'ask_author', side_effect=[('ok', 'First'), ('cancel', '')]) as prompt:
-            obj.next_request()
+            obj.next_dwemer('test')
         self.assertFalse(obj.busy)
         obj.organizer.onNextRefresh.assert_not_called()
         self.assertEqual(prompt.call_count, 2)

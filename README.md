@@ -5,13 +5,33 @@ An MO2 2.5.3 / PyQt6 plugin for filling missing authors on installed mods.
 Copy `nexus_author_metadata.py` into your MO2 `plugins` folder.
 
 Restart MO2, select multiple installed mods in the left pane using Ctrl or Shift,
-then right-click and choose **Fill missing authors from Nexus**.
+then right-click and choose **Fill missing authors from Nexus / Dwemer**.
 
 Uses MO2's existing Nexus login. Fills only blank author fields from Nexus's
-author value; the uploader is a separate field and is not substituted. If Nexus
-cannot supply an author, a box shows the mod name and the lookup problem so you
-can enter the author manually. This also works for mods without a Nexus ID or
-from other repositories. **OK** applies the entered author to the current mod and
+author value; the uploader is a separate field and is not substituted. Unresolved
+mods are then checked on Dwemer Mods before manual entry is offered.
+
+Dwemer lookups use a saved `url`, `website`, or `customURL` pointing to a Dwemer
+mod page when available. Otherwise, the plugin searches using the installed mod
+name and the archive filename from `installationFile`, if present. Automatic
+name searches support Skyrim SE/VR; saved Dwemer links work independently of the
+game. Only a unique exact title match (ignoring case, spaces and punctuation)
+is accepted automatically. Version/ID suffixes are removed for searching but
+never used to justify an automatic match. Ambiguous or partial matches open a
+picker with **Enter author manually** as the default choice; Cancel cancels the
+batch. Paginated search results always require confirmation. Each query checks
+the first results page and the picker lists up to 20 candidates.
+
+Dwemer author values come from **Created by**, never **Uploaded by** or the
+page's uploader-based structured metadata. The plugin uses public pages without
+a Dwemer login, so content hidden from anonymous visitors cannot be retrieved.
+Requests run asynchronously with timeouts, a short delay and a cache for the
+current batch. Access/rate-limit or connection errors stop further Dwemer
+requests in that batch and leave unresolved mods for manual entry. Search sends
+the selected mod names and archive-derived search terms to Dwemer Mods.
+
+If neither source supplies an author, a box shows the mod name and lookup
+problem so you can enter the author manually. **OK** applies it to the current mod and
 asks for the next one. **All** applies that author to the current mod and all
 remaining unresolved mods without more prompts. Authors entered with earlier OK
 clicks are kept. **Cancel** (or closing the box) cancels the entire batch without
@@ -19,11 +39,9 @@ saving, including earlier entries and fetched results. A nonblank author is
 required for OK or All. Existing authors are never overwritten. No mod contents
 are edited.
 
-Requests run sequentially, one per distinct game/mod ID. A login/access/rate-limit
-error stops further lookups. Cancel discards fetched results without applying them.
-Timed-out requests stop further lookups. After lookups finish or stop, manual
-entry is offered for unresolved mods, including those affected by access errors
-or timeouts. Cancelling the fetching progress window discards the entire batch
+Nexus requests run sequentially, one per distinct game/mod ID. A login/access/rate-limit
+error or timeout stops further Nexus lookups, then Dwemer lookups begin.
+Cancelling the fetching progress window discards the entire batch
 without opening manual-entry boxes. Completion is silent; reports record outcomes.
 
 Before writing, the plugin waits for any already-running MO2 refresh. Each metadata
@@ -38,4 +56,6 @@ Offline verification: set `MO2_DIR` to your MO2 installation directory and run
 `test_plugin.py` with Python 3.12. It uses MO2's bundled
 Qt and a stub host interface. Live MO2 menu integration and authenticated Nexus
 requests were verified in MO2 2.5.3 beta 12. Automated tests cover the menu's
-multiple selection, Nexus response handling, and metadata preservation.
+multiple selection, Nexus response handling, Dwemer parsing and matching,
+candidate selection, batch cancellation, and metadata preservation. Live public
+Dwemer search and creator extraction were also checked using the bundled Qt network stack.

@@ -1,4 +1,4 @@
-"""Fill missing installed-mod authors from Nexus via the left-pane context menu."""
+"""Fill missing installed-mod authors from Nexus, Dwemer Mods, or manual entry."""
 from pathlib import Path
 from datetime import datetime
 import json
@@ -6,12 +6,215 @@ import os
 import shutil
 import tempfile
 import uuid
+import re
+import unicodedata
+from html.parser import HTMLParser
+from urllib.parse import urlencode, urlsplit, urljoin
 
 import mobase
-from PyQt6.QtCore import QObject, QEvent, QSettings, QTimer
+from PyQt6.QtCore import QObject, QEvent, QSettings, QTimer, QUrl
 from PyQt6.QtGui import QAction
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QLabel,
-                            QLineEdit, QMenu, QMessageBox, QProgressDialog, QVBoxLayout)
+                            QInputDialog, QLineEdit, QMenu, QMessageBox, QProgressDialog, QVBoxLayout)
+
+
+DWEMER = "https://dwemermods.com"
+
+
+def dwemer_url(value):
+    """Accept only a Dwemer mod-detail URL, never an arbitrary metadata URL."""
+    try:
+        parts = urlsplit(str(value or "").strip())
+    except ValueError:
+        return ""
+    if parts.scheme not in ("http", "https") or parts.netloc.lower() not in ("dwemermods.com", "www.dwemermods.com"):
+        return ""
+    match = re.fullmatch(r"/mods/(\d+)/?", parts.path)
+    return f"{DWEMER}/mods/{match[1]}?lang=en" if match else ""
+
+
+def normalized_name(value):
+    return "".join(c for c in unicodedata.normalize("NFKC", value).casefold() if c.isalnum())
+
+
+def search_names(row):
+    names = [row["mod"]]
+    archive = re.split(r"[/\\]", str(row.get("installationFile", "")))[-1]
+    archive = re.sub(r"\.(?:zip|7z|rar)$", "", archive, flags=re.I)
+    if archive:
+        names.append(archive)
+    queries = []
+    for name in names:
+        # Remove archive version/ID suffixes for searching, not for auto-matching.
+        name = re.sub(r"[-_ ](?:v?\d[\d._-]*)(?:[-_ ].*)?$", "", name, flags=re.I)
+        name = re.sub(r"[_]+", " ", name).strip()
+        if len(normalized_name(name)) >= 4 and name.casefold() not in [q.casefold() for q in queries]:
+            queries.append(name[:150])
+    return names, queries[:2]
+
+
+class DwemerPage(HTMLParser):
+    """Read titles from search cards and creator credits from the detail header."""
+    def __init__(self, html):
+        super().__init__(convert_charrefs=True)
+        self.candidates = {}
+        self.creators = []
+        self.more = False
+        self.title_depth = 0
+        self.anchor = None
+        self.div_depth = 0
+        self.meta_depth = None
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "div":
+            self.div_depth += 1
+            if "mod-meta-row" in attrs.get("class", "").split():
+                self.meta_depth = self.div_depth
+        if tag == "h3" and "mod-title" in attrs.get("class", "").split():
+            self.title_depth += 1
+        if tag == "a":
+            href = attrs.get("href", "")
+            url = dwemer_url(urljoin(DWEMER, href))
+            creator = (self.meta_depth is not None and href.startswith("/known-authors/?")
+                       and "mod-category-link" in attrs.get("class", "").split())
+            if (self.title_depth and url) or creator:
+                self.anchor = (url if not creator else "creator", [])
+            if re.search(r"[?&]page=\d+", href):
+                self.more = True
+
+    def handle_data(self, data):
+        if self.anchor:
+            self.anchor[1].append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "div":
+            if self.meta_depth == self.div_depth:
+                self.meta_depth = None
+            self.div_depth = max(0, self.div_depth - 1)
+        if tag == "h3":
+            self.title_depth = 0
+        if tag == "a" and self.anchor:
+            key, chunks = self.anchor
+            text = " ".join("".join(chunks).split())
+            if text:
+                if key == "creator":
+                    self.creators.append(text)
+                else:
+                    self.candidates[key] = {"title": text, "url": key}
+            self.anchor = None
+
+    @property
+    def author(self):
+        return ", ".join(dict.fromkeys(self.creators))
+
+
+def choose_dwemer(parent, name, candidates):
+    labels = ["Enter author manually"] + [f"{c['title']} — {c['url']}" for c in candidates]
+    selected, accepted = QInputDialog.getItem(
+        parent, "Choose Dwemer mod", f"Which page matches {name}?", labels, 0, False)
+    if not accepted:
+        return None
+    return "" if selected == labels[0] else candidates[labels.index(selected) - 1]["url"]
+
+
+class DwemerClient(QObject):
+    """Sequential asynchronous requests, with batch caching and bounded timeouts."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.network = QNetworkAccessManager(self)
+        self.cache = {}
+        self.reply = None
+        self.closed = False
+        self.unavailable = ""
+
+    def get(self, url, callback):
+        if self.closed:
+            return
+        if self.unavailable:
+            callback("", self.unavailable)
+            return
+        if url in self.cache:
+            callback(*self.cache[url])
+            return
+        request = QNetworkRequest(QUrl(url))
+        request.setRawHeader(b"User-Agent", b"Mozilla/5.0 (compatible; MO2 Author Metadata)")
+        request.setTransferTimeout(15000)
+        request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                             QNetworkRequest.RedirectPolicy.SameOriginRedirectPolicy)
+        reply = self.network.get(request)
+        self.reply = reply
+        watchdog = QTimer(reply)
+        watchdog.setSingleShot(True)
+        watchdog.timeout.connect(reply.abort)
+        watchdog.start(20000)
+
+        def finished():
+            watchdog.stop()
+            if self.reply is reply:
+                self.reply = None
+            if not self.closed:
+                status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+                error = "" if reply.error() == QNetworkReply.NetworkError.NoError else reply.errorString()
+                if status in (401, 403, 429) or status is None or (error and status == 200):
+                    self.unavailable = f"Dwemer unavailable ({status or error})"
+                    error = self.unavailable
+                data = bytes(reply.readAll()).decode("utf-8", errors="replace") if not error else ""
+                self.cache[url] = (data, error)
+                callback(data, error)
+            reply.deleteLater()
+
+        reply.finished.connect(finished)
+
+    def close(self):
+        self.closed = True
+        if self.reply is not None:
+            self.reply.abort()
+
+    def lookup(self, row, callback):
+        for key in ("url", "website", "customURL"):
+            url = dwemer_url(row.get(key))
+            if url:
+                self.detail(url, callback)
+                return
+        if str(row.get("game", "")).casefold() not in ("", "skyrimse", "skyrimvr", "skyrimspecialedition"):
+            callback({"error": "Dwemer name search supports Skyrim SE/VR"})
+            return
+        names, queries = search_names(row)
+        candidates = {}
+        paginated = False
+
+        def next_search():
+            if not queries:
+                exact = [c for c in candidates.values()
+                         if normalized_name(c["title"]) in {normalized_name(n) for n in names}]
+                if len(exact) == 1 and not paginated:
+                    self.detail(exact[0]["url"], callback)
+                else:
+                    callback({"candidates": list(candidates.values())[:20]})
+                return
+            query = queries.pop(0)
+            self.get(f"{DWEMER}/mods?" + urlencode({"search": query, "search_in": "title", "lang": "en"}), searched)
+
+        def searched(html, error):
+            nonlocal paginated
+            if error:
+                callback({"error": error})
+                return
+            page = DwemerPage(html)
+            candidates.update(page.candidates)
+            paginated = paginated or page.more
+            QTimer.singleShot(350, next_search)
+
+        next_search()
+
+    def detail(self, url, callback):
+        def parsed(html, error):
+            author = DwemerPage(html).author if not error else ""
+            callback({"author": author, "url": url, "error": error or ("" if author else "Dwemer returned no creator credit")})
+        self.get(url, parsed)
 
 
 class AuthorDialog(QDialog):
@@ -58,7 +261,8 @@ def ask_author(parent, mod, reason, remaining):
 
 def metadata(path):
     settings = QSettings(str(path), QSettings.Format.IniFormat)
-    return {key: settings.value(key, "") for key in ("author", "modid", "gameName")}
+    return {key: settings.value(key, "") for key in
+            ("author", "modid", "gameName", "url", "website", "customURL", "installationFile")}
 
 
 def nexus_skip_reason(game, modid, repository):
@@ -116,6 +320,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         self.window = None
         self.busy = False
         self.bridge = None
+        self.dwemer = None
 
     def name(self):
         return "Nexus Author Metadata"
@@ -124,10 +329,10 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Ron / OpenAI"
 
     def description(self):
-        return "Right-click selected installed mods to fill missing Nexus authors."
+        return "Right-click selected installed mods to fill missing authors from Nexus or Dwemer Mods."
 
     def version(self):
-        return mobase.VersionInfo(1, 2, 0)
+        return mobase.VersionInfo(1, 3, 0)
 
     def settings(self):
         return []
@@ -154,7 +359,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
                 mod = self.organizer.modList().getMod(name)
                 if mod and not any((mod.isSeparator(), mod.isForeign(), mod.isBackup(), mod.isOverwrite())):
                     names.append(name)
-        action = QAction("Fill missing authors from Nexus", menu)
+        action = QAction("Fill missing authors from Nexus / Dwemer", menu)
         action.setEnabled(bool(names) and not self.busy)
         action.triggered.connect(lambda checked=False: QTimer.singleShot(0, lambda: self.start(names)))
         menu.addSeparator()
@@ -167,6 +372,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         self.rows = []
         self.groups = {}
         self.results = {}
+        self.dwemer_started = False
         self.token = uuid.uuid4().hex
         try:
             for name in dict.fromkeys(names):
@@ -183,6 +389,10 @@ class NexusAuthorMetadata(mobase.IPlugin):
                         continue
                     game, modid = mod.gameName(), mod.nexusId()
                     row.update(game=game, modid=modid)
+                    row.update({key: info[key] for key in ("url", "website", "customURL", "installationFile")})
+                    if any(dwemer_url(row.get(key)) for key in ("url", "website", "customURL")):
+                        row["status"] = "Pending: Dwemer link"
+                        continue
                     reason = nexus_skip_reason(game, modid, mod.repository())
                     if reason:
                         row["status"] = reason
@@ -223,13 +433,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
             return
         if not self.queue:
             self.current = None
-            self.progress.hide()
-            if not self.prompt_missing_authors():
-                self.cancel()
-                return
-            self.progress.setLabelText("Saving author metadata…")
-            # Wait for an existing refresh, or apply now; do not start another.
-            self.organizer.onNextRefresh(self.apply, True)
+            self.start_dwemer()
             return
         self.current = self.queue.pop(0)
         game, modid = self.current
@@ -281,12 +485,63 @@ class NexusAuthorMetadata(mobase.IPlugin):
         self.current = None
         QTimer.singleShot(0, self.next_request)
 
+    def start_dwemer(self):
+        if self.dwemer_started:
+            return
+        self.dwemer_started = True
+        self.dwemer_queue = [row for row in self.rows
+                             if row["status"] not in ("Ready", "Skipped: author already present")
+                             and "game" in row and "modid" in row]
+        self.dwemer_total = len(self.dwemer_queue)
+        self.dwemer = DwemerClient(self.progress)
+        self.progress.setRange(0, self.dwemer_total)
+        self.next_dwemer(self.token)
+
+    def next_dwemer(self, token):
+        if not self.busy or token != self.token:
+            return
+        if not self.dwemer_queue:
+            self.progress.hide()
+            if not self.prompt_missing_authors():
+                self.cancel()
+                return
+            self.progress.setLabelText("Saving author metadata…")
+            self.organizer.onNextRefresh(self.apply, True)
+            return
+        row = self.dwemer_queue.pop(0)
+        self.progress.setLabelText(f"Searching Dwemer Mods: {row['mod']}")
+        self.progress.setValue(self.dwemer_total - len(self.dwemer_queue) - 1)
+        self.dwemer.lookup(row, lambda result: self.dwemer_result(token, row, result))
+
+    def dwemer_result(self, token, row, result):
+        if not self.busy or token != self.token:
+            return
+        candidates = result.get("candidates", [])
+        if candidates:
+            self.progress.hide()
+            url = choose_dwemer(self.window, row["mod"], candidates)
+            if url is None:
+                self.cancel()
+                return
+            self.progress.show()
+            if url:
+                self.dwemer.detail(url, lambda detail: self.dwemer_result(token, row, detail))
+                return
+        if result.get("author"):
+            row.update(author=result["author"], status="Ready", source="dwemer", source_url=result["url"])
+        else:
+            row["dwemer_status"] = result.get("error") or "No Dwemer match selected or found"
+        QTimer.singleShot(350, lambda: self.next_dwemer(token))
+
     def prompt_missing_authors(self):
         pending = [row for row in self.rows
                    if row["status"] not in ("Ready", "Skipped: author already present")
                    and "game" in row and "modid" in row]
         for index, row in enumerate(pending):
-            action, author = ask_author(self.window, row["mod"], row["status"], len(pending) - index)
+            reason = row["status"]
+            if row.get("dwemer_status"):
+                reason += "\n" + row["dwemer_status"]
+            action, author = ask_author(self.window, row["mod"], reason, len(pending) - index)
             if action == "cancel":
                 return False
             targets = pending[index:] if action == "all" else [row]
@@ -327,6 +582,9 @@ class NexusAuthorMetadata(mobase.IPlugin):
 
     def cleanup(self):
         self.busy = False
+        if self.dwemer is not None:
+            self.dwemer.close()
+            self.dwemer = None
         if hasattr(self, "timer"):
             self.timer.stop()
         if hasattr(self, "progress"):
