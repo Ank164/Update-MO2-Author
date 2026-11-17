@@ -8,12 +8,18 @@ Restart MO2, select multiple installed mods in the left pane using Ctrl or Shift
 then right-click and choose **Fill missing authors from Nexus**.
 
 Uses MO2's existing Nexus login. Fills only blank author fields from Nexus's
-author value; the uploader is a separate field and is not substituted. Mods
-without a valid Nexus mod ID and game are skipped. No mod contents are edited.
+author value; the uploader is a separate field and is not substituted. If Nexus
+cannot supply an author, a box shows the mod name and the lookup problem so you
+can enter the author manually. This also works for mods without a Nexus ID or
+from other repositories. Each mod gets its own entry; Cancel or a blank entry
+skips that mod. Existing authors are never overwritten. No mod contents are edited.
 
 Requests run sequentially, one per distinct game/mod ID. A login/access/rate-limit
 error stops further lookups. Cancel discards fetched results without applying them.
-Timed-out requests stop the batch. Completion is silent; reports record outcomes.
+Timed-out requests stop further lookups. After lookups finish or stop, manual
+entry is offered for unresolved mods, including those affected by access errors
+or timeouts. Cancelling the fetching progress window discards the entire batch
+without opening manual-entry boxes. Completion is silent; reports record outcomes.
 
 Before writing, the plugin waits for any already-running MO2 refresh. Each metadata
 file is edited with Qt's own INI codec, verified and replaced atomically.

@@ -10,7 +10,7 @@ import uuid
 import mobase
 from PyQt6.QtCore import QObject, QEvent, QSettings, QTimer
 from PyQt6.QtGui import QAction
-from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QProgressDialog
+from PyQt6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox, QProgressDialog
 
 
 def metadata(path):
@@ -84,7 +84,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Right-click selected installed mods to fill missing Nexus authors."
 
     def version(self):
-        return mobase.VersionInfo(1, 0, 3)
+        return mobase.VersionInfo(1, 1, 0)
 
     def settings(self):
         return []
@@ -139,11 +139,11 @@ class NexusAuthorMetadata(mobase.IPlugin):
                         row["status"] = "Skipped: author already present"
                         continue
                     game, modid = mod.gameName(), mod.nexusId()
+                    row.update(game=game, modid=modid)
                     reason = nexus_skip_reason(game, modid, mod.repository())
                     if reason:
                         row["status"] = reason
                         continue
-                    row.update(game=game, modid=modid)
                     self.groups.setdefault((game, modid), []).append(row)
                 except Exception as error:
                     row["status"] = f"Failed: {error}"
@@ -155,9 +155,17 @@ class NexusAuthorMetadata(mobase.IPlugin):
             self.progress.setAutoClose(False)
             self.progress.setAutoReset(False)
             self.progress.canceled.connect(self.cancel)
-            self.bridge = self.organizer.createNexusBridge()
-            self.bridge.descriptionAvailable.connect(self.received)
-            self.bridge.requestFailed.connect(self.failed)
+            if self.queue:
+                try:
+                    self.bridge = self.organizer.createNexusBridge()
+                except Exception as error:
+                    for rows in self.groups.values():
+                        for row in rows:
+                            row["status"] = f"Failed: Nexus unavailable: {error}"
+                    self.queue.clear()
+                if self.bridge is not None:
+                    self.bridge.descriptionAvailable.connect(self.received)
+                    self.bridge.requestFailed.connect(self.failed)
             self.timer = QTimer(self.progress)
             self.timer.setSingleShot(True)
             self.timer.timeout.connect(self.timeout)
@@ -171,6 +179,9 @@ class NexusAuthorMetadata(mobase.IPlugin):
         if not self.busy:
             return
         if not self.queue:
+            self.current = None
+            self.progress.hide()
+            self.prompt_missing_authors()
             self.progress.setLabelText("Saving author metadata…")
             # Wait for an existing refresh, or apply now; do not start another.
             self.organizer.onNextRefresh(self.apply, True)
@@ -218,7 +229,30 @@ class NexusAuthorMetadata(mobase.IPlugin):
         if self.current:
             for row in self.groups[self.current]:
                 row["status"] = "Failed: Nexus request timed out"
-        self.cancel()
+        for key in self.queue:
+            for row in self.groups[key]:
+                row["status"] = "Skipped: Nexus timeout stopped batch"
+        self.queue.clear()
+        self.current = None
+        QTimer.singleShot(0, self.next_request)
+
+    def prompt_missing_authors(self):
+        for row in self.rows:
+            if row["status"] in ("Ready", "Skipped: author already present"):
+                continue
+            # Only offer a write when the mod identity was captured successfully.
+            if "game" not in row or "modid" not in row:
+                continue
+            reason = row["status"]
+            author, accepted = QInputDialog.getText(
+                self.window,
+                "Enter mod author",
+                f"Mod: {row['mod']}\n{reason}\n\n"
+                "Enter the author manually, or Cancel to skip this mod:",
+            )
+            author = author.strip()
+            if accepted and author:
+                row.update(author=author, status="Ready", source="manual", nexus_status=reason)
 
     def cancel(self):
         if not self.busy:
