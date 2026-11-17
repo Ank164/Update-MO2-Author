@@ -108,16 +108,27 @@ class DwemerPage(HTMLParser):
 
     @property
     def author(self):
-        return ", ".join(dict.fromkeys(self.creators))
+        return ", ".join(dict.fromkeys(name for name in self.creators
+                                      if normalized_name(name) not in ("unknown", "na", "none", "unspecified")))
 
 
 def choose_dwemer(parent, name, candidates):
     labels = ["Enter author manually"] + [f"{c['title']} — {c['url']}" for c in candidates]
-    selected, accepted = QInputDialog.getItem(
-        parent, "Choose Dwemer mod", f"Which page matches {name}?", labels, 0, False)
-    if not accepted:
-        return None
-    return "" if selected == labels[0] else candidates[labels.index(selected) - 1]["url"]
+    message = (f"Which page matches {name}?" if candidates else f"No public search results for {name}.")
+    message += "\nChoose a page, paste a Dwemer mod URL, or select manual entry.\nCancel cancels the entire batch."
+    while True:
+        selected, accepted = QInputDialog.getItem(
+            parent, "Choose Dwemer mod", message, labels, 0, True)
+        if not accepted:
+            return None
+        if not selected.strip() or selected == labels[0]:
+            return ""
+        if selected in labels[1:]:
+            return candidates[labels.index(selected) - 1]["url"]
+        url = dwemer_url(selected)
+        if url:
+            return url
+        QMessageBox.warning(parent, "Invalid Dwemer URL", "Paste a mod page URL such as https://dwemermods.com/mods/4699.")
 
 
 class DwemerClient(QObject):
@@ -224,7 +235,8 @@ class AuthorDialog(QDialog):
         self.action = "cancel"
         layout = QVBoxLayout(self)
         label = QLabel(f"Mod: {mod}\n{reason}\n\n"
-                       f"{remaining} mods remaining. OK sets this mod; All sets all remaining mods.")
+                       f"{remaining} mods remaining. OK sets this mod; All sets all remaining mods.\n"
+                       "Skip leaves this mod unchanged. Cancel discards the entire batch, including selected pages.")
         label.setWordWrap(True)
         layout.addWidget(label)
         self.author = QLineEdit(self)
@@ -233,6 +245,7 @@ class AuthorDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self.all = buttons.addButton("All", QDialogButtonBox.ButtonRole.ActionRole)
+        self.skip = buttons.addButton("Skip", QDialogButtonBox.ButtonRole.ActionRole)
         self.all.setEnabled(False)
         self.all.setVisible(remaining > 1)
         self.ok.setEnabled(False)
@@ -240,6 +253,7 @@ class AuthorDialog(QDialog):
         buttons.accepted.connect(lambda: self.choose("ok"))
         buttons.rejected.connect(self.reject)
         self.all.clicked.connect(lambda: self.choose("all"))
+        self.skip.clicked.connect(lambda: self.choose("skip"))
         layout.addWidget(buttons)
 
     def enable_buttons(self, enabled):
@@ -247,7 +261,7 @@ class AuthorDialog(QDialog):
         self.all.setEnabled(enabled)
 
     def choose(self, action):
-        if self.author.text().strip():
+        if action == "skip" or self.author.text().strip():
             self.action = action
             self.accept()
 
@@ -292,7 +306,12 @@ def nexus_skip_reason(game, modid, repository):
 def write_author(path, author, expected_author=None):
     """Use Qt's INI codec (including escaped strings), with atomic replacement."""
     path = Path(path)
-    original = path.read_bytes()
+    try:
+        original = path.read_bytes()
+    except FileNotFoundError:
+        if not path.parent.is_dir():
+            raise
+        original = None
     current = str(metadata(path)["author"])
     if expected_author is None:
         if current.strip():
@@ -304,7 +323,8 @@ def write_author(path, author, expected_author=None):
     handle, temporary = tempfile.mkstemp(prefix=".author-", suffix=".ini", dir=path.parent)
     os.close(handle)
     try:
-        shutil.copyfile(path, temporary)
+        if original is not None:
+            shutil.copyfile(path, temporary)
         settings = QSettings(temporary, QSettings.Format.IniFormat)
         settings.setValue("author", author)
         settings.sync()
@@ -313,9 +333,16 @@ def write_author(path, author, expected_author=None):
         del settings
         if metadata(temporary)["author"] != author:
             raise OSError("Author read-back did not match")
-        if path.read_bytes() != original:
-            raise OSError("Metadata changed during update; skipped")
-        os.replace(temporary, path)
+        if original is None:
+            # Publish the complete file without replacing one created meanwhile.
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                raise OSError("Metadata created during update; skipped") from None
+        else:
+            if path.read_bytes() != original:
+                raise OSError("Metadata changed during update; skipped")
+            os.replace(temporary, path)
         return True
     finally:
         if os.path.exists(temporary):
@@ -354,7 +381,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Update selected mod authors from Nexus or Dwemer Mods, confirming existing authors first."
 
     def version(self):
-        return mobase.VersionInfo(1, 4, 1)
+        return mobase.VersionInfo(1, 5, 0)
 
     def settings(self):
         return []
@@ -391,6 +418,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         if self.busy:
             return
         self.busy = True
+        self.cancelled = False
         self.rows = []
         self.groups = {}
         self.results = {}
@@ -541,7 +569,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         if not self.busy or token != self.token:
             return
         candidates = result.get("candidates", [])
-        if candidates:
+        if "candidates" in result:
             self.progress.hide()
             url = choose_dwemer(self.window, row["mod"], candidates)
             if url is None:
@@ -570,6 +598,9 @@ class NexusAuthorMetadata(mobase.IPlugin):
             action, author = ask_author(self.window, row["mod"], reason, len(pending) - index)
             if action == "cancel":
                 return False
+            if action == "skip":
+                row["status"] = "Skipped: manual entry skipped"
+                continue
             targets = pending[index:] if action == "all" else [row]
             for target in targets:
                 target.update(author=author, status="Ready", source="manual", nexus_status=target["status"])
@@ -580,6 +611,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
     def cancel(self):
         if not self.busy:
             return
+        self.cancelled = True
         for row in self.rows:
             if row["status"] in ("", "Ready"):
                 row["status"] = "Cancelled: no change made"
@@ -632,6 +664,11 @@ class NexusAuthorMetadata(mobase.IPlugin):
             report.write_text(json.dumps(self.rows, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as error:
             print(f"[{self.name()}] Could not save report: {error}")
+        failures = [row for row in self.rows if row["status"].startswith("Failed:")]
+        if failures and not getattr(self, "cancelled", False):
+            details = "\n".join(f"{row['mod']}: {row['status']}" for row in failures[:5])
+            QMessageBox.warning(self.window, self.name(),
+                                f"Could not update authors for {len(failures)} mods.\n\n{details}\n\nReport: {report_dir}")
 
 
 def createPlugin():

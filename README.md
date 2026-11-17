@@ -25,12 +25,15 @@ game. Only a unique exact title match (ignoring case, spaces and punctuation)
 is accepted automatically. Version/ID suffixes are removed for searching but
 never used to justify an automatic match. Ambiguous or partial matches open a
 picker with **Enter author manually** as the default choice; Cancel cancels the
-batch. Paginated search results always require confirmation. Each query checks
+batch. You can also paste a Dwemer mod-page URL into the picker, including when
+public search finds nothing. Paginated search results always require confirmation. Each query checks
 the first results page and the picker lists up to 20 candidates.
 
 Dwemer author values come from **Created by**, never **Uploaded by** or the
 page's uploader-based structured metadata. The plugin uses public pages without
-a Dwemer login, so content hidden from anonymous visitors cannot be retrieved.
+a Dwemer login. Some mods are omitted from public search even though their
+detail pages can be read directly; paste their page URLs into the picker.
+Pages that require login cannot be retrieved.
 Requests run asynchronously with timeouts, a short delay and a cache for the
 current batch. Access/rate-limit or connection errors stop further Dwemer
 requests in that batch and leave unresolved mods for manual entry. Search sends
@@ -40,7 +43,8 @@ If neither source supplies an author, a box shows the mod name and lookup
 problem so you can enter the author manually. **OK** applies it to the current mod and
 asks for the next one. **All** applies that author to the current mod and all
 remaining unresolved mods without more prompts. Authors entered with earlier OK
-clicks are kept. **Cancel** (or closing the box) cancels the entire batch without
+clicks are kept. **Skip** leaves the current mod unchanged and continues, keeping
+successful page lookups and other entries. **Cancel** (or closing the box) cancels the entire batch without
 saving, including earlier entries and fetched results. A nonblank author is
 required for OK or All. Existing authors are replaced only after the initial
 overwrite confirmation. No mod contents are edited.
@@ -48,10 +52,12 @@ overwrite confirmation. No mod contents are edited.
 Nexus requests run sequentially, one per distinct game/mod ID. A login/access/rate-limit
 error or timeout stops further Nexus lookups, then Dwemer lookups begin.
 Cancelling the fetching progress window discards the entire batch
-without opening manual-entry boxes. Completion is silent; reports record outcomes.
+without opening manual-entry boxes. Successful completion is silent; failures
+show a warning, and reports record outcomes.
 
 Before writing, the plugin waits for any already-running MO2 refresh. Each metadata
-file is edited with Qt's own INI codec, verified and replaced atomically.
+file is edited with Qt's own INI codec, verified and replaced atomically. A missing
+`meta.ini` is created without replacing a file another process created meanwhile.
 MO2 refreshes once afterward if any authors changed. Unrelated INI values are preserved, though Qt can
 normalize formatting. Each author is checked against its initial value immediately
 before writing; a value changed during the batch is preserved and reported instead
