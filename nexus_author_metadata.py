@@ -373,7 +373,8 @@ class AuthorDialog(QDialog):
         self.action = "cancel"
         layout = QVBoxLayout(self)
         label = QLabel(f"Mod: {mod}\n{reason}\n\n"
-                       f"{remaining} mods remaining. OK sets this mod; All sets all remaining mods.")
+                       f"{remaining} mods remaining. OK sets this mod; All sets all remaining mods.\n"
+                       "Leave the author blank and press OK to skip this mod and continue.")
         label.setWordWrap(True)
         layout.addWidget(label)
         self.author = QLineEdit(self)
@@ -384,7 +385,6 @@ class AuthorDialog(QDialog):
         self.all = buttons.addButton("All", QDialogButtonBox.ButtonRole.ActionRole)
         self.all.setEnabled(False)
         self.all.setVisible(remaining > 1)
-        self.ok.setEnabled(False)
         self.author.textChanged.connect(lambda text: self.enable_buttons(bool(text.strip())))
         buttons.accepted.connect(lambda: self.choose("ok"))
         buttons.rejected.connect(self.reject)
@@ -392,11 +392,10 @@ class AuthorDialog(QDialog):
         layout.addWidget(buttons)
 
     def enable_buttons(self, enabled):
-        self.ok.setEnabled(enabled)
         self.all.setEnabled(enabled)
 
     def choose(self, action):
-        if self.author.text().strip():
+        if action == "ok" or self.author.text().strip():
             self.action = action
             self.accept()
 
@@ -517,7 +516,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Update selected mod authors from Nexus or Dwemer Mods, confirming existing authors first."
 
     def version(self):
-        return mobase.VersionInfo(1, 6, 0)
+        return mobase.VersionInfo(1, 6, 1)
 
     def settings(self):
         return []
@@ -772,6 +771,9 @@ class NexusAuthorMetadata(mobase.IPlugin):
             action, author = ask_author(self.window, row["mod"], reason, len(pending) - index)
             if action == "cancel":
                 return False
+            if not author.strip():
+                row["status"] = "Skipped: no author entered"
+                continue
             targets = pending[index:] if action == "all" else [row]
             for target in targets:
                 target.update(author=author, status="Ready", source="manual", nexus_status=target["status"])

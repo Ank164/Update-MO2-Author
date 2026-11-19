@@ -27,6 +27,44 @@ app.addLibraryPath(str(ROOT / 'dlls'))
 
 
 class Tests(unittest.TestCase):
+    def test_blank_ok_skips_unknown_and_preserves_other_authors_in_batch(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths, mods = {}, {}
+            for name, author in [('Found', ''), ('Unknown', ''), ('Existing', 'Known Author')]:
+                directory = Path(folder) / name
+                directory.mkdir()
+                paths[name] = directory / 'meta.ini'
+                paths[name].write_text(f'[General]\nauthor={author}\n', encoding='utf-8')
+                mods[name] = types.SimpleNamespace(
+                    absolutePath=lambda directory=directory: str(directory), nexusId=lambda: 0,
+                    gameName=lambda: 'SkyrimSE', repository=lambda: '')
+            unchanged = {name: paths[name].read_bytes() for name in ('Unknown', 'Existing')}
+            obj = plugin.NexusAuthorMetadata()
+            refreshed = []
+            obj.organizer = types.SimpleNamespace(
+                modList=lambda: types.SimpleNamespace(getMod=mods.get), pluginDataPath=lambda: folder,
+                refresh=lambda: refreshed.append(True), onNextRefresh=lambda done, immediate: done())
+            def lookup(row, done):
+                done({'author': 'Fetched Creator', 'url': 'https://dwemermods.com/mods/1'}
+                     if row['mod'] == 'Found' else {})
+            with patch.object(plugin.DwemerClient, 'lookup', side_effect=lookup), \
+                 patch.object(plugin.QTimer, 'singleShot', side_effect=lambda delay, done: done()), \
+                 patch.object(plugin, 'confirm_overwrite', return_value=True), \
+                 patch.object(plugin, 'ask_author', side_effect=[('ok', '   '), ('ok', '')]):
+                obj.start(list(mods))
+            self.assertEqual(plugin.metadata(paths['Found'])['author'], 'Fetched Creator')
+            self.assertEqual([row['status'] for row in obj.rows], ['Updated', 'Skipped: no author entered', 'Skipped: no author entered'])
+            self.assertTrue(all(paths[name].read_bytes() == original for name, original in unchanged.items()))
+            self.assertEqual(refreshed, [True])
+
+    def test_blank_ok_accepts_dialog_but_all_remains_disabled(self):
+        dialog = plugin.AuthorDialog(None, 'Unknown', 'No author found', 2)
+        self.assertTrue(dialog.ok.isEnabled())
+        self.assertFalse(dialog.all.isEnabled())
+        dialog.ok.click()
+        self.assertEqual(dialog.action, 'ok')
+        self.assertEqual(dialog.result(), plugin.QDialog.DialogCode.Accepted)
+
     def test_browser_transport_keeps_requests_separate_and_ignores_cancelled_reply(self):
         from PyQt6.QtCore import QProcess
         with tempfile.TemporaryDirectory() as profile, patch.object(plugin, 'QProcess') as process_type:
@@ -421,10 +459,10 @@ class Tests(unittest.TestCase):
         for action in ('ok', 'all', 'cancel'):
             with self.subTest(action=action):
                 dialog = plugin.AuthorDialog(None, 'Test mod', 'Nexus unavailable', 3)
-                self.assertFalse(dialog.ok.isEnabled())
+                self.assertTrue(dialog.ok.isEnabled())
                 self.assertFalse(dialog.all.isEnabled())
                 dialog.author.setText('   ')
-                self.assertFalse(dialog.ok.isEnabled())
+                self.assertTrue(dialog.ok.isEnabled())
                 dialog.author.setText('  Author  ')
                 self.assertTrue(dialog.ok.isEnabled())
                 self.assertTrue(dialog.all.isEnabled())

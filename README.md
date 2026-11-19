@@ -59,9 +59,11 @@ If neither source supplies an author, a box shows the mod name and lookup
 problem so you can enter the author manually. **OK** applies it to the current mod and
 asks for the next one. **All** applies that author to the current mod and all
 remaining unresolved mods without more prompts. Authors entered with earlier OK
-clicks are kept. **Cancel** (or closing the box) cancels the entire batch without
-saving, including earlier entries and fetched results. A nonblank author is
-required for OK or All. Existing authors are replaced only after the initial
+clicks are kept. Leave the author blank and press **OK** to skip that mod and
+continue without discarding successful lookups or earlier entries. This leaves
+the mod's metadata unchanged, including any existing author. **All** requires a
+nonblank author. **Cancel** (or closing the box) cancels the entire batch without
+saving, including earlier entries and fetched results. Existing authors are replaced only after the initial
 overwrite confirmation. No mod contents are edited.
 
 Nexus requests run sequentially, one per distinct game/mod ID. A login/access/rate-limit
