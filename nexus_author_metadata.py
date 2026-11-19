@@ -12,7 +12,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlencode, urlsplit, urljoin
 
 import mobase
-from PyQt6.QtCore import QObject, QEvent, QSettings, QTimer, QUrl
+from PyQt6.QtCore import QObject, QEvent, QProcess, QSettings, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PyQt6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QLabel,
@@ -20,6 +20,142 @@ from PyQt6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QLabel,
 
 
 DWEMER = "https://dwemermods.com"
+
+
+class DwemerBrowser(QObject):
+    """Own one optional browser helper. No credentials cross this interface."""
+    problem = pyqtSignal(str)
+
+    def __init__(self, root, profile_dir, parent=None):
+        super().__init__(parent)
+        launcher = shutil.which("py")
+        script = Path(__file__).parent / "nexus_author_support" / "dwemer_browser.py"
+        if not launcher or not script.is_file():
+            raise RuntimeError("Dwemer sign-in requires Python 3.12 and the nexus_author_support folder.")
+        self.login_open = False
+        self.ready = False
+        self.error = ""
+        self.closing = False
+        self.buffer = bytearray()
+        self.pending = {}
+        self.request_timers = {}
+        self.queue = []
+        self.process = QProcess(self)
+        self.process.setProgram(launcher)
+        self.process.setArguments(["-3.12", "-s", str(script), "--mo2-dir", str(root), "--profile-dir", str(profile_dir)])
+        self.process.setWorkingDirectory(str(root))
+        self.process.readyReadStandardOutput.connect(self.read_messages)
+        self.process.readyReadStandardError.connect(lambda: self.process.readAllStandardError())
+        self.process.errorOccurred.connect(lambda unused: self.fail("Dwemer browser could not start. Check Python 3.12 and the browser bindings."))
+        self.process.finished.connect(lambda *unused: self.fail("Dwemer browser closed. Reopen Sign in to Dwemer to reconnect."))
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(lambda: self.fail("Dwemer browser did not start in time."))
+        self.timer.start(20000)
+        self.process.start()
+
+    def send(self, message):
+        if self.ready:
+            self.process.write((json.dumps(message) + "\n").encode("utf-8"))
+        else:
+            self.queue.append(message)
+
+    def read_messages(self):
+        self.buffer.extend(bytes(self.process.readAllStandardOutput()))
+        while b"\n" in self.buffer:
+            line, _, rest = self.buffer.partition(b"\n")
+            self.buffer = bytearray(rest)
+            try:
+                message = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            self.receive(message)
+
+    def receive(self, message):
+        if self.error or self.closing:
+            return
+        event = message.get("event")
+        if event == "ready":
+            self.timer.stop()
+            self.ready = True
+            queue, self.queue = self.queue, []
+            for command in queue:
+                self.send(command)
+        elif event in ("login_opened", "login_closed"):
+            self.login_open = event == "login_opened"
+        elif event == "error":
+            self.fail(message.get("error", "Dwemer browser failed"))
+        else:
+            callback = self.pending.pop(message.get("id"), None)
+            self.stop_request_timer(message.get("id"))
+            if callback:
+                callback(message.get("html", ""), message.get("error", ""))
+
+    def get(self, url, callback):
+        if self.error:
+            callback("", self.error)
+            return None
+        request_id = uuid.uuid4().hex
+        self.pending[request_id] = callback
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: self.request_timeout(request_id))
+        self.request_timers[request_id] = timer
+        timer.start(45000)
+        self.send({"action": "fetch", "id": request_id, "url": url})
+        return request_id
+
+    def sign_in(self):
+        self.login_open = True
+        self.send({"action": "login"})
+
+    def cancel(self, request_id):
+        self.pending.pop(request_id, None)
+        self.stop_request_timer(request_id)
+        self.queue = [item for item in self.queue if item.get("id") != request_id]
+        self.send({"action": "cancel", "id": request_id})
+
+    def stop_request_timer(self, request_id):
+        timer = self.request_timers.pop(request_id, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+
+    def request_timeout(self, request_id):
+        callback = self.pending.get(request_id)
+        self.cancel(request_id)
+        if callback:
+            callback("", "Dwemer browser did not answer in time")
+
+    def fail(self, error):
+        self.timer.stop()
+        if self.error or self.closing:
+            return
+        interactive = self.login_open
+        self.error = error
+        self.ready = False
+        self.login_open = False
+        self.queue.clear()
+        callbacks, self.pending = self.pending, {}
+        for request_id in list(self.request_timers):
+            self.stop_request_timer(request_id)
+        for callback in callbacks.values():
+            callback("", error)
+        if interactive:
+            self.problem.emit(error)
+
+    def shutdown(self):
+        self.closing = True
+        self.timer.stop()
+        self.pending.clear()
+        for request_id in list(self.request_timers):
+            self.stop_request_timer(request_id)
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            self.send({"action": "shutdown"})
+            self.process.closeWriteChannel()
+            if not self.process.waitForFinished(1500):
+                self.process.kill()
+                self.process.waitForFinished(1000)
 
 
 def dwemer_url(value):
@@ -122,13 +258,15 @@ def choose_dwemer(parent, name, candidates):
 
 class DwemerClient(QObject):
     """Sequential asynchronous requests, with batch caching and bounded timeouts."""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, browser=None):
         super().__init__(parent)
         self.network = QNetworkAccessManager(self)
         self.cache = {}
         self.reply = None
         self.closed = False
         self.unavailable = ""
+        self.browser = browser
+        self.browser_request = None
 
     def get(self, url, callback):
         if self.closed:
@@ -138,6 +276,15 @@ class DwemerClient(QObject):
             return
         if url in self.cache:
             callback(*self.cache[url])
+            return
+        if self.browser is not None:
+            def browser_result(html, error):
+                self.browser_request = None
+                if self.closed:
+                    return
+                self.cache[url] = (html, error)
+                callback(html, error)
+            self.browser_request = self.browser.get(url, browser_result)
             return
         request = QNetworkRequest(QUrl(url))
         request.setRawHeader(b"User-Agent", b"Mozilla/5.0 (compatible; MO2 Author Metadata)")
@@ -170,6 +317,8 @@ class DwemerClient(QObject):
 
     def close(self):
         self.closed = True
+        if self.browser is not None and self.browser_request is not None:
+            self.browser.cancel(self.browser_request)
         if self.reply is not None:
             self.reply.abort()
 
@@ -356,6 +505,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         self.busy = False
         self.bridge = None
         self.dwemer = None
+        self.browser = None
 
     def name(self):
         return "Nexus Author Metadata"
@@ -367,7 +517,7 @@ class NexusAuthorMetadata(mobase.IPlugin):
         return "Update selected mod authors from Nexus or Dwemer Mods, confirming existing authors first."
 
     def version(self):
-        return mobase.VersionInfo(1, 4, 2)
+        return mobase.VersionInfo(1, 6, 0)
 
     def settings(self):
         return []
@@ -381,6 +531,32 @@ class NexusAuthorMetadata(mobase.IPlugin):
     def attach(self, window):
         self.window = window
         QApplication.instance().installEventFilter(self.filter)
+        QApplication.instance().aboutToQuit.connect(self.close_browser)
+
+    def close_browser(self):
+        if self.browser is not None:
+            self.browser.shutdown()
+
+    def browser_profile_path(self):
+        return Path(self.organizer.pluginDataPath()) / "nexus_author_metadata" / "dwemer-browser"
+
+    def get_browser(self):
+        if self.browser is not None and self.browser.error:
+            self.browser.shutdown()
+            self.browser.deleteLater()
+            self.browser = None
+        if self.browser is None:
+            self.browser = DwemerBrowser(QApplication.applicationDirPath(), self.browser_profile_path())
+            self.browser.problem.connect(lambda error: QMessageBox.warning(self.window, "Dwemer sign-in", error))
+        return self.browser
+
+    def sign_in_dwemer(self):
+        if self.busy:
+            return
+        try:
+            self.get_browser().sign_in()
+        except Exception as error:
+            QMessageBox.warning(self.window, "Dwemer sign-in", str(error))
 
     def add_menu(self, menu, view):
         if menu.property("nexusAuthorMetadataAdded"):
@@ -399,9 +575,16 @@ class NexusAuthorMetadata(mobase.IPlugin):
         action.triggered.connect(lambda checked=False: QTimer.singleShot(0, lambda: self.start(names)))
         menu.addSeparator()
         menu.addAction(action)
+        login = QAction("Sign in to Dwemer…", menu)
+        login.setEnabled(not self.busy)
+        login.triggered.connect(lambda checked=False: self.sign_in_dwemer())
+        menu.addAction(login)
 
     def start(self, names):
         if self.busy:
+            return
+        if self.browser is not None and self.browser.login_open:
+            QMessageBox.information(self.window, self.name(), "Finish signing in and close the Dwemer window before updating authors.")
             return
         self.busy = True
         self.rows = []
@@ -530,7 +713,13 @@ class NexusAuthorMetadata(mobase.IPlugin):
                              if row["status"] not in ("Ready", "Skipped: author already present")
                              and "game" in row and "modid" in row]
         self.dwemer_total = len(self.dwemer_queue)
-        self.dwemer = DwemerClient(self.progress)
+        browser = self.browser
+        if browser is None and self.browser_profile_path().is_dir():
+            try:
+                browser = self.get_browser()
+            except RuntimeError:
+                browser = None
+        self.dwemer = DwemerClient(self.progress, browser=browser)
         self.progress.setRange(0, self.dwemer_total)
         self.next_dwemer(self.token)
 

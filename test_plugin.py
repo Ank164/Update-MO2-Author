@@ -27,6 +27,62 @@ app.addLibraryPath(str(ROOT / 'dlls'))
 
 
 class Tests(unittest.TestCase):
+    def test_browser_transport_keeps_requests_separate_and_ignores_cancelled_reply(self):
+        from PyQt6.QtCore import QProcess
+        with tempfile.TemporaryDirectory() as profile, patch.object(plugin, 'QProcess') as process_type:
+            browser = plugin.DwemerBrowser(ROOT, Path(profile))
+            process = process_type.return_value
+            first, second = unittest.mock.Mock(), unittest.mock.Mock()
+            one = browser.get('https://dwemermods.com/mods/1', first)
+            two = browser.get('https://dwemermods.com/mods/2', second)
+            self.assertNotEqual(one, two)
+            process.write.assert_not_called()
+            browser.receive({'event': 'ready'})
+            self.assertEqual(process.write.call_count, 2)
+            sent = [__import__('json').loads(call.args[0]) for call in process.write.call_args_list]
+            self.assertEqual([item['url'] for item in sent], ['https://dwemermods.com/mods/1', 'https://dwemermods.com/mods/2'])
+            browser.cancel(one)
+            browser.receive({'id': one, 'html': 'Wrong row', 'error': ''})
+            browser.receive({'id': two, 'html': 'Second row', 'error': ''})
+            first.assert_not_called()
+            second.assert_called_once_with('Second row', '')
+            browser.timer.stop()
+
+    def test_session_client_uses_browser_caches_result_and_cancels_pending_fetch(self):
+        callbacks = []
+        browser = types.SimpleNamespace(get=unittest.mock.Mock(side_effect=lambda url, done: callbacks.append(done) or 'request'),
+                                        cancel=unittest.mock.Mock())
+        client = plugin.DwemerClient(browser=browser)
+        found = []
+        client.get('https://dwemermods.com/mods/1', lambda html, error: found.append((html, error)))
+        callbacks[0]('Creator page', '')
+        client.get('https://dwemermods.com/mods/1', lambda html, error: found.append((html, error)))
+        self.assertEqual(browser.get.call_count, 1)
+        self.assertEqual(found, [('Creator page', ''), ('Creator page', '')])
+        client.get('https://dwemermods.com/mods/2', lambda html, error: found.append((html, error)))
+        client.close()
+        browser.cancel.assert_called_once_with('request')
+        callbacks[-1]('Late page', '')
+        self.assertEqual(len(found), 2)
+
+    def test_helper_allows_only_dwemer_catalogue_and_detail_requests(self):
+        spec = importlib.util.spec_from_file_location('browser_helper', REPO / 'nexus_author_support' / 'dwemer_browser.py')
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        for url in ['https://dwemermods.com/mods?search=Example', 'https://dwemermods.com/mods/123?lang=en']:
+            self.assertTrue(helper.allowed_url(url))
+        for url in ['https://example.com/', 'https://dwemermods.com/login', 'http://dwemermods.com/mods/1',
+                    'https://dwemermods.com.evil.test/mods/1', 'https://dwemermods.com@evil.test/mods/1']:
+            self.assertFalse(helper.allowed_url(url))
+
+    def test_author_update_waits_until_sign_in_window_is_closed(self):
+        obj = plugin.NexusAuthorMetadata()
+        obj.browser = types.SimpleNamespace(login_open=True)
+        with patch.object(plugin.QMessageBox, 'information') as message:
+            obj.start(['Example'])
+        self.assertFalse(obj.busy)
+        self.assertEqual(message.call_count, 1)
+
     def test_manual_batch_saves_when_meta_ini_is_missing(self):
         with tempfile.TemporaryDirectory() as folder:
             mods, paths = {}, {}
@@ -474,7 +530,8 @@ class Tests(unittest.TestCase):
         obj.add_menu(menu, view)
         obj.add_menu(menu, view)
         actions = [action for action in menu.actions() if not action.isSeparator()]
-        self.assertEqual(len(actions), 1)
+        self.assertEqual(len(actions), 2)
+        self.assertEqual(actions[1].text(), 'Sign in to Dwemer…')
         self.assertTrue(actions[0].isEnabled())
         captured = []
         obj.start = lambda names: captured.extend(names)

@@ -2,7 +2,23 @@
 
 An MO2 2.5.3 / PyQt6 plugin for updating authors on installed mods.
 
-Copy `nexus_author_metadata.py` into your MO2 `plugins` folder.
+Copy `nexus_author_metadata.py` and the `nexus_author_support` folder into your
+MO2 `plugins` folder.
+
+Optional Dwemer sign-in: right-click a mod and choose **Sign in to Dwemer…**.
+A separate browser window opens on Dwemer's actual login page. Sign in there,
+enable NSFW in your Dwemer profile settings if needed, and close the window.
+Author updates will then use that browser session, including across MO2 restarts.
+To sign out, reopen that window and use Dwemer's own logout control.
+
+The optional browser needs the Windows Python launcher with Python 3.12 and
+PyQt6-WebEngine bindings matching MO2's PyQt6/Qt versions. For this installation
+(PyQt6 6.11.0 / Qt 6.11.1), the bindings are PyQt6-WebEngine 6.11.0. The browser
+runs separately so MO2's application startup and Qt libraries are not modified.
+It stores its browser profile under `plugins/data/nexus_author_metadata/dwemer-browser`.
+Passwords and login cookies are not sent to the author plugin or written to its
+settings/reports. Keep this browser profile private; it contains your login session.
+No sign-in is required to continue using public Dwemer pages.
 
 Restart MO2, select multiple installed mods in the left pane using Ctrl or Shift,
 then right-click and choose **Update authors from Nexus / Dwemer**.
@@ -29,8 +45,11 @@ batch. Paginated search results always require confirmation. Each query checks
 the first results page and the picker lists up to 20 candidates.
 
 Dwemer author values come from **Created by**, never **Uploaded by** or the
-page's uploader-based structured metadata. The plugin uses public pages without
-a Dwemer login, so content hidden from anonymous visitors cannot be retrieved.
+page's structured metadata. Without the optional sign-in, searches use public
+pages, so content hidden from anonymous visitors cannot be found. With sign-in,
+searches load in the helper's actual browser session and honor your Dwemer
+account's content settings. An expired login or disabled NSFW setting can still
+hide results; reopen **Sign in to Dwemer…** to check your account.
 Requests run asynchronously with timeouts, a short delay and a cache for the
 current batch. Access/rate-limit or connection errors stop further Dwemer
 requests in that batch and leave unresolved mods for manual entry. Search sends
